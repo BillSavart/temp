@@ -12,10 +12,8 @@ from tqdm import tqdm
 import nvdiffrast.torch as dr
 
 from gaussian_renderer import GaussianModel, render
-from scene import Scene
 from pbr import CubemapLight, get_brdf_lut, pbr_shading
 from utils.general_utils import safe_state
-from arguments import GroupParams, ModelParams, PipelineParams, get_combined_args
 
 
 # ---------------------------
@@ -44,7 +42,6 @@ def rotate_latlong(latlong: torch.Tensor, shift: float) -> torch.Tensor:
 def latlong_to_cubemap(latlong_map: torch.Tensor, res: int = 256) -> torch.Tensor:
     cubemap = torch.zeros(6, res, res, 3, dtype=torch.float32, device="cuda")
 
-    # 來源自 relight.py 的 cube_to_dir 對應面
     def cube_to_dir_face(s, x, y):
         if s == 0:   rx, ry, rz = torch.ones_like(x), -y, -x
         elif s == 1: rx, ry, rz = -torch.ones_like(x), -y, x
@@ -65,99 +62,94 @@ def latlong_to_cubemap(latlong_map: torch.Tensor, res: int = 256) -> torch.Tenso
         tu = torch.atan2(v[..., 0:1], -v[..., 2:3]) / (2 * np.pi) + 0.5
         tv = torch.acos(torch.clamp(v[..., 1:2], -1, 1)) / np.pi
         texcoord = torch.cat((tu, tv), dim=-1)
-        cubemap[s] = dr.texture(latlong_map[None], texcoord[None], filter_mode="linear")[0]
+
+        cubemap[s] = dr.texture(
+            latlong_map[None], texcoord[None], filter_mode="linear"
+        )[0]
 
     return cubemap
 
 
 # ---------------------------
-# 主程式：產生日出動畫
+# 主程式：產生日出動畫（無 Scene 版本）
 # ---------------------------
 @torch.no_grad()
-def launch(model_path, checkpoint_path, hdri_path, dataset, pipeline):
+def launch(checkpoint_path, hdri_path, output_dir):
 
-    print(">>> [DEBUG] Sunrise renderer launching…")
-    print("model_path =", model_path)
-    print("checkpoint =", checkpoint_path)
-    print("hdri =", hdri_path)
+    print(">>> [START] Sunrise minimal renderer")
+    checkpoint = torch.load(checkpoint_path)
 
-    # 讀取 GS-IR 模型
-    gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians, shuffle=False)
+    # 讀 gaussians
+    gaussians = GaussianModel(sh_degree=checkpoint["gaussians"]["sh_degree"])
+    gaussians.restore(checkpoint["gaussians"])
+    print(">>> Gaussians loaded.")
 
-    ckpt = torch.load(checkpoint_path)
-    gaussians.restore(ckpt["gaussians"])
-    print(">>> [DEBUG] Checkpoint loaded.")
-
-    # 讀 HDR
+    # HDR
     hdri_np = read_hdr(hdri_path)
     hdri = torch.from_numpy(hdri_np).cuda().float()
     hdri = hdri / hdri.max()
-    print(">>> [DEBUG] HDR loaded:", hdri.shape)
+    print(">>> HDR loaded:", hdri.shape)
 
-    # 輸出目錄
-    out_dir = os.path.join(model_path, "sunrise_anim")
-    makedirs(out_dir, exist_ok=True)
-    print(">>> [DEBUG] Saving frames to:", out_dir)
+    makedirs(output_dir, exist_ok=True)
 
-    # 動畫參數
+    # 動畫配置
     fps = 30
     seconds = 5
-    total_frames = fps * seconds
+    frames = fps * seconds
 
-    test_views = scene.getTestCameras()
-    if len(test_views) == 0:
-        print(">>> [ERROR] No test cameras found! Cannot render.")
-        return
+    # 建立一個固定 camera（不依賴 dataset）
+    H, W = 1080, 1920
+    fx = fy = 1200
+    cx, cy = W / 2, H / 2
 
-    view = test_views[0]
+    class FakeCamera:
+        pass
 
-    # PBR LUT
+    cam = FakeCamera()
+    cam.image_height = H
+    cam.image_width = W
+    cam.world_view_transform = torch.eye(4, device="cuda")
+    cam.projection_matrix = torch.tensor([
+        [fx, 0, cx, 0],
+        [0, fy, cy, 0],
+        [0, 0, 1, 0]
+    ], device="cuda")
+
     brdf_lut = get_brdf_lut().cuda()
 
-    canonical_rays = scene.get_canonical_rays()
+    canonical_rays = gaussians.get_xyz.detach().unsqueeze(0)  # fake rays placeholder
 
     # ---------------------------
-    # 逐幀渲染
+    # 開始逐幀
     # ---------------------------
-    for i in tqdm(range(total_frames), desc="Rendering sunrise"):
+    for i in tqdm(range(frames), desc="Sunrise"):
 
-        t = i / (total_frames - 1)
-        shift = t * 0.25   # 太陽從左到右升起（0→90º）
+        t = i / (frames - 1)
+        shift = t * 0.25
 
         rotated = rotate_latlong(hdri, shift)
-
         cubemap = CubemapLight(base_res=256).cuda()
-        cubemap.base.data = latlong_to_cubemap(rotated, 256)
-        cubemap.eval()
+        cubemap.base.data = latlong_to_cubemap(rotated)
 
         rendering = render(
-            viewpoint_camera=view,
-            pc=scene.gaussians,
-            pipe=pipeline,
-            bg_color=torch.tensor([0, 0, 0], device="cuda", dtype=torch.float32),
+            viewpoint_camera=cam,
+            pc=gaussians,
+            pipe=None,
+            bg_color=torch.tensor([0,0,0], device="cuda"),
             inference=True,
             pad_normal=True,
             derive_normal=True,
         )
 
-        H, W = view.image_height, view.image_width
-        c2w = torch.inverse(view.world_view_transform.T)
+        normal = rendering["normal_map"].permute(1,2,0)
+        albedo = rendering["albedo_map"].permute(1,2,0)
+        roughness = rendering["roughness_map"].permute(1,2,0)
+        metallic = rendering["metallic_map"].permute(1,2,0)
 
-        view_dirs = -(
-            (F.normalize(canonical_rays[:, None], p=2, dim=-1) * c2w[None, :3, :3])
-            .sum(dim=-1)
-            .reshape(H, W, 3)
-        )
+        view_dirs = torch.zeros_like(normal)
+        mask = rendering["normal_mask"].permute(1,2,0)
 
-        albedo = rendering["albedo_map"].permute(1, 2, 0)
-        normal = rendering["normal_map"].permute(1, 2, 0)
-        roughness = rendering["roughness_map"].permute(1, 2, 0)
-        metallic = rendering["metallic_map"].permute(1, 2, 0)
-
-        mask = rendering["normal_mask"].permute(1, 2, 0)
-
-        pbr_img = pbr_shading(
+        shaded = pbr_shading(
             light=cubemap,
             normals=normal,
             view_dirs=view_dirs,
@@ -168,33 +160,21 @@ def launch(model_path, checkpoint_path, hdri_path, dataset, pipeline):
             brdf_lut=brdf_lut,
         )["render_rgb"]
 
-        img = pbr_img.clamp(0, 1).permute(2, 0, 1)
-        torchvision.utils.save_image(img, os.path.join(out_dir, f"{i:04d}.png"))
+        img = shaded.clamp(0,1).permute(2,0,1)
+        torchvision.utils.save_image(img, os.path.join(output_dir, f"{i:04d}.png"))
 
-    print(">>> Done! Sunrise frames saved:", out_dir)
-    print(f"ffmpeg -framerate 30 -i {out_dir}/%04d.png -c:v libx264 sunrise.mp4")
+    print(">>> Done. Saved to:", output_dir)
 
 
 # ---------------------------
-# 程式入口
+# Entry point
 # ---------------------------
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Sunrise animation")
-    model = ModelParams(parser, sentinel=True)
-    pipeline = PipelineParams(parser)
+    parser = ArgumentParser()
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--hdri", required=True)
+    parser.add_argument("--out", default="sunrise_anim")
+    args = parser.parse_args()
 
-    parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--hdri", type=str, required=True)
-
-    args = get_combined_args(parser)
-
-    model_path = os.path.dirname(args.checkpoint)
-    safe_state(args.quiet)
-
-    launch(
-        model_path=model_path,
-        checkpoint_path=args.checkpoint,
-        hdri_path=args.hdri,
-        dataset=model.extract(args),
-        pipeline=pipeline.extract(args),
-    )
+    safe_state(False)
+    launch(args.checkpoint, args.hdri, args.out)
