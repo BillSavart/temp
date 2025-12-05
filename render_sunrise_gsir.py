@@ -79,10 +79,21 @@ def launch(checkpoint_path, hdri_path, output_dir):
     print(">>> [START] Sunrise minimal renderer")
     checkpoint = torch.load(checkpoint_path)
 
-    # 讀 gaussians
-    gaussians = GaussianModel(sh_degree=checkpoint["gaussians"]["sh_degree"])
-    gaussians.restore(checkpoint["gaussians"])
-    print(">>> Gaussians loaded.")
+    # --- 支援 GS-IR 兩種不同的 checkpoint 格式 ---
+    if isinstance(checkpoint, dict):
+    # 格式1：{"gaussians": {...}, "cubemap": {...}, ...}
+        ckpt_gauss = checkpoint["gaussians"]
+    elif isinstance(checkpoint, tuple):
+    # 格式2：(gaussians, cubemap, irradiance_volumes)
+        ckpt_gauss = checkpoint[0]
+    else:
+        raise TypeError("Unknown checkpoint format:", type(checkpoint))
+
+    # 建立 GaussianModel
+    gaussians = GaussianModel(sh_degree=ckpt_gauss["sh_degree"])
+    gaussians.restore(ckpt_gauss)
+
+    print(">>> Gaussians loaded. (checkpoint format OK)")
 
     # HDR
     hdri_np = read_hdr(hdri_path)
