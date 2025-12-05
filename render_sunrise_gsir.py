@@ -70,6 +70,10 @@ def latlong_to_cubemap(latlong_map: torch.Tensor, res: int = 256) -> torch.Tenso
 
 @torch.no_grad()
 def launch(model_path, checkpoint, hdri_path, dataset, pipeline, fps=30, seconds=5):
+    print("=== DEBUG: STARTING SUNRISE RENDER ===")
+    print("checkpoint =", checkpoint)
+    print("hdri_path =", hdri_path)
+    print("model_path =", model_path)
 
     # Load scene + gaussians
     gaussians = GaussianModel(dataset.sh_degree)
@@ -84,14 +88,19 @@ def launch(model_path, checkpoint, hdri_path, dataset, pipeline, fps=30, seconds
 
     # Load checkpoint
     ckpt = torch.load(checkpoint)
+    print("=== DEBUG: loading checkpoint ===")
+
     if isinstance(ckpt, dict):
         gaussians.restore(ckpt["gaussians"])
     else:
         gaussians.restore(ckpt)
-
+    print("ckpt keys:", ckpt.keys())
     # Create output folder
     out_dir = os.path.join(model_path, "sunrise_anim")
     makedirs(out_dir, exist_ok=True)
+    print("=== DEBUG: out_dir =", out_dir)
+    print("=== DEBUG: exists? ", os.path.exists(out_dir))
+
 
     # Animation parameters
     total_frames = fps * seconds
@@ -107,6 +116,8 @@ def launch(model_path, checkpoint, hdri_path, dataset, pipeline, fps=30, seconds
         cubemap.eval()
 
         # Rendering first test camera only
+        print("=== DEBUG: number of test cameras =", len(scene.getTestCameras()))
+
         view = scene.getTestCameras()[0]
 
         rendering_result = render(
